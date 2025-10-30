@@ -4,11 +4,14 @@ import os
 import re
 import struct
 import ipaddress
+import random  # Added for randomization
 from Cryptodome.Hash import MD4
 from textwrap import dedent
+from impacket import smb as smb_imp  # Added to fix NameError
 
 from impacket.smbconnection import SMBConnection, SessionError
 from impacket.smb import SMB_DIALECT
+from impacket.smb3structs import SMB2_DIALECT_002, SMB2_DIALECT_21
 from impacket.examples.secretsdump import (
     RemoteOperations,
     SAMHashes,
@@ -41,6 +44,7 @@ from impacket.dcerpc.v5 import tsts as TSTS
 from nxc.config import process_secret, host_info_colors, check_guest_account
 from nxc.connection import connection, sem, requires_admin, dcom_FirewallChecker
 from nxc.helpers.misc import gen_random_string, validate_ntlm
+from nxc.helpers.bloodhound import add_user_bh
 from nxc.logger import NXCAdapter
 from nxc.protocols.smb.dpapi import collect_masterkeys_from_target, get_domain_backup_key, upgrade_to_dploot_connection
 from nxc.protocols.smb.firefox import FirefoxCookie, FirefoxData, FirefoxTriage
@@ -55,7 +59,6 @@ from nxc.protocols.smb.samruser import UserSamrDump
 from nxc.protocols.smb.samrfunc import SamrFunc
 from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.logger import highlight
-from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.powershell import create_ps_command
 from nxc.helpers.misc import detect_if_ip
 from nxc.protocols.ldap.resolution import LDAPResolution
@@ -103,6 +106,32 @@ def get_error_string(exception):
     else:
         return str(exception)
 
+
+class MySMBConnection(SMBConnection):
+    def negotiateSession(self, preferredDialect=None,
+                         flags1=smb_imp.SMB.FLAGS1_PATHCASELESS | smb_imp.SMB.FLAGS1_CANONICALIZED_PATHS,
+                         flags2=smb_imp.SMB.FLAGS2_EXTENDED_SECURITY | smb_imp.SMB.FLAGS2_NT_STATUS | smb_imp.SMB.FLAGS2_LONG_NAMES,
+                         negoData='\x02NT LM 0.12\x00\x02SMB 2.002\x00\x02SMB 2.???\x00'):
+        if preferredDialect is None:
+            # Randomize preferredDialect for fallback
+            dialects = [smb_imp.SMB_DIALECT, SMB2_DIALECT_002, SMB2_DIALECT_21]
+            preferredDialect = random.choice(dialects)
+        super().negotiateSession(preferredDialect, flags1, flags2, negoData)
+
+    def negotiateSessionWildcard(self, myName, remoteName, remoteHost, sess_port, timeout, extended_security=True, flags1=0,
+                                 flags2=0, data=None):
+        smbp = smb.NewSMBPacket()
+        smbp['Flags1'] = flags1
+        smbp['Flags2'] = flags2 | smb.SMB.FLAGS2_UNICODE
+        negSession = smb.SMBCommand(smb.SMB.SMB_COM_NEGOTIATE)
+        if extended_security is True:
+            smbp['Flags2'] |= smb.SMB.FLAGS2_EXTENDED_SECURITY
+        negSession['Data'] = data
+        # Add random padding to negotiation data
+        padding = b'\x00' * random.randint(1, 10)
+        negSession['Data'] += padding
+        smbp.addCommand(negSession)
+        super().negotiateSessionWildcard(myName, remoteName, remoteHost, sess_port, timeout, extended_security, flags1, flags2, data)
 
 class smb(connection):
     def __init__(self, args, db, host):
@@ -541,7 +570,7 @@ class smb(connection):
     def create_smbv1_conn(self, check=False):
         self.logger.info(f"Creating SMBv1 connection to {self.host}")
         try:
-            conn = SMBConnection(
+            conn = MySMBConnection(
                 self.remoteName,
                 self.host,
                 None,
@@ -572,7 +601,7 @@ class smb(connection):
     def create_smbv3_conn(self):
         self.logger.info(f"Creating SMBv3 connection to {self.host}")
         try:
-            self.conn = SMBConnection(
+            self.conn = MySMBConnection(
                 self.remoteName,
                 self.host,
                 None,
